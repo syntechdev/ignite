@@ -347,7 +347,7 @@ public class IgniteCacheProxyImpl<K, V> extends AsyncSupportAdapter<IgniteCache<
 
     /** {@inheritDoc} */
     @Override public Lock lockAll(final Collection<? extends K> keys) {
-        return new CacheLockImpl<>(ctx.gate(), delegate, new CacheOperationContext(), keys);
+        return new CacheLockImpl<>(ctx.gate(), delegate, ctx.operationContextPerCall(), keys);
     }
 
     /** {@inheritDoc} */
@@ -755,6 +755,9 @@ public class IgniteCacheProxyImpl<K, V> extends AsyncSupportAdapter<IgniteCache<
             (qry instanceof SqlQuery || qry instanceof SqlFieldsQuery || qry instanceof TextQuery))
             throw new CacheException("Failed to execute query. Add module 'ignite-indexing' to the classpath " +
                     "of all Ignite nodes.");
+
+        if (qry.isLocal() && (qry instanceof SqlQuery) && ctx.kernalContext().clientNode())
+            throw new CacheException("Execution of local sql query on client node disallowed.");
     }
 
     /** {@inheritDoc} */
@@ -1445,9 +1448,7 @@ public class IgniteCacheProxyImpl<K, V> extends AsyncSupportAdapter<IgniteCache<
             @Override public T applyx(IgniteInternalFuture<EntryProcessorResult<T>> fut1)
                 throws IgniteCheckedException {
                 try {
-                    EntryProcessorResult<T> res = fut1.get();
-
-                    return res != null ? res.get() : null;
+                    return fut1.get().get();
                 }
                 catch (RuntimeException e) {
                     throw new GridClosureException(e);
@@ -1711,6 +1712,11 @@ public class IgniteCacheProxyImpl<K, V> extends AsyncSupportAdapter<IgniteCache<
         throw new UnsupportedOperationException();
     }
 
+    /** {@inheritDoc} */
+    @Override public IgniteCache<K, V> withAllowAtomicOpsInTx() {
+        throw new UnsupportedOperationException();
+    }
+
     /**
      * Method converts exception to IgniteCacheRestartingException in case of cache restarting
      * or to CacheException in other cases.
@@ -1791,6 +1797,16 @@ public class IgniteCacheProxyImpl<K, V> extends AsyncSupportAdapter<IgniteCache<
     }
 
     /** {@inheritDoc} */
+    @Override public void clearStatistics() {
+        try {
+            ctx.kernalContext().cache().clearStatistics(Collections.singleton(getName()));
+        }
+        catch (IgniteCheckedException e) {
+            throw cacheException(e);
+        }
+    }
+
+    /** {@inheritDoc} */
     @Override public void writeExternal(ObjectOutput out) throws IOException {
         out.writeObject(ctx);
 
@@ -1806,7 +1822,7 @@ public class IgniteCacheProxyImpl<K, V> extends AsyncSupportAdapter<IgniteCache<
     }
 
     /** {@inheritDoc} */
-    @Override public IgniteFuture<?> rebalance() {
+    @Override public IgniteFuture<Boolean> rebalance() {
         return new IgniteFutureImpl<>(ctx.preloader().forceRebalance());
     }
 

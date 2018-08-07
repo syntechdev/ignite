@@ -59,6 +59,7 @@ import org.apache.ignite.internal.util.typedef.CI1;
 import org.apache.ignite.internal.util.typedef.F;
 import org.apache.ignite.internal.util.typedef.P1;
 import org.apache.ignite.internal.util.typedef.X;
+import org.apache.ignite.internal.util.typedef.internal.CU;
 import org.apache.ignite.internal.util.typedef.internal.S;
 import org.apache.ignite.internal.util.typedef.internal.U;
 import org.apache.ignite.lang.IgniteBiClosure;
@@ -76,10 +77,6 @@ import static org.apache.ignite.transactions.TransactionState.PREPARING;
  */
 public class GridNearOptimisticTxPrepareFuture extends GridNearOptimisticTxPrepareFutureAdapter implements
     IgniteDiagnosticAware {
-    /** */
-    @GridToStringExclude
-    private KeyLockFuture keyLockFut;
-
     /** */
     private int miniId;
 
@@ -143,7 +140,7 @@ public class GridNearOptimisticTxPrepareFuture extends GridNearOptimisticTxPrepa
      * @param e Error.
      * @param discoThread {@code True} if executed from discovery thread.
      */
-    void onError(Throwable e, boolean discoThread) {
+    private void onError(Throwable e, boolean discoThread) {
         if (e instanceof IgniteTxTimeoutCheckedException) {
             onTimeout();
 
@@ -329,15 +326,13 @@ public class GridNearOptimisticTxPrepareFuture extends GridNearOptimisticTxPrepa
             if (!txStateCheck) {
                 if (tx.isRollbackOnly() || tx.setRollbackOnly()) {
                     if (tx.remainingTime() == -1)
-                        onError(new IgniteTxTimeoutCheckedException("Transaction timed out and " +
-                            "was rolled back: " + this), false);
+                        onDone(tx.timeoutException());
                     else
-                        onError(new IgniteCheckedException("Invalid transaction state for prepare " +
-                            "[state=" + tx.state() + ", tx=" + this + ']'), false);
+                        onDone(tx.rollbackException());
                 }
                 else
-                    onError(new IgniteTxRollbackCheckedException("Invalid transaction state for " +
-                        "prepare [state=" + tx.state() + ", tx=" + this + ']'), false);
+                    onDone(new IgniteCheckedException("Invalid transaction state for " +
+                        "prepare [state=" + tx.state() + ", tx=" + this + ']'));
 
                 return;
             }
@@ -435,7 +430,7 @@ public class GridNearOptimisticTxPrepareFuture extends GridNearOptimisticTxPrepa
 
             GridDistributedTxMapping updated = map(write, topVer, cur, topLocked, remap);
 
-            if(updated == null)
+            if (updated == null)
                 // an exception occurred while transaction mapping, stop further processing
                 break;
 
@@ -768,8 +763,12 @@ public class GridNearOptimisticTxPrepareFuture extends GridNearOptimisticTxPrepa
                         U.warn(log, "Failed to detect deadlock.", e);
                     else {
                         e = new IgniteTxTimeoutCheckedException("Failed to acquire lock within provided timeout for " +
-                            "transaction [timeout=" + tx.timeout() + ", tx=" + tx + ']',
+                            "transaction [timeout=" + tx.timeout() + ", tx=" + CU.txString(tx) + ']',
                             deadlock != null ? new TransactionDeadlockException(deadlock.toString(cctx)) : null);
+
+                        if (!ERR_UPD.compareAndSet(GridNearOptimisticTxPrepareFuture.this, null, e) && err instanceof IgniteTxTimeoutCheckedException) {
+                            err = e;
+                        }
                     }
 
                     onDone(null, e);

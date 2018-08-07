@@ -33,6 +33,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.UUID;
 import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
@@ -50,7 +51,6 @@ import org.apache.ignite.IgniteSystemProperties;
 import org.apache.ignite.cluster.ClusterNode;
 import org.apache.ignite.configuration.CommunicationFailureResolver;
 import org.apache.ignite.events.EventType;
-import org.apache.ignite.internal.ClusterMetricsSnapshot;
 import org.apache.ignite.internal.IgniteClientDisconnectedCheckedException;
 import org.apache.ignite.internal.IgniteFutureTimeoutCheckedException;
 import org.apache.ignite.internal.IgniteInternalFuture;
@@ -89,7 +89,6 @@ import org.apache.zookeeper.CreateMode;
 import org.apache.zookeeper.KeeperException;
 import org.apache.zookeeper.WatchedEvent;
 import org.apache.zookeeper.data.Stat;
-import org.jboss.netty.util.internal.ConcurrentHashMap;
 import org.jetbrains.annotations.Nullable;
 
 import static org.apache.ignite.events.EventType.EVT_CLIENT_NODE_DISCONNECTED;
@@ -815,17 +814,8 @@ public class ZookeeperDiscoveryImpl {
                     dirs.add(dir);
             }
 
-            try {
-                if (!dirs.isEmpty())
-                    client.createAll(dirs, PERSISTENT);
-            }
-            catch (KeeperException.NodeExistsException e) {
-                if (log.isDebugEnabled())
-                    log.debug("Failed to create nodes using bulk operation: " + e);
-
-                for (String dir : dirs)
-                    client.createIfNeeded(dir, null, PERSISTENT);
-            }
+            if (!dirs.isEmpty())
+                client.createAll(dirs, PERSISTENT);
         }
         catch (ZookeeperClientFailedException e) {
             throw new IgniteSpiException("Failed to initialize Zookeeper nodes", e);
@@ -1364,7 +1354,16 @@ public class ZookeeperDiscoveryImpl {
                 if (prevEvts.clusterId.equals(newEvts.clusterId)) {
                     U.warn(log, "All server nodes failed, notify all clients [locId=" + locNode.id() + ']');
 
-                    generateNoServersEvent(newEvts, stat);
+                    try {
+                        generateNoServersEvent(newEvts, stat);
+                    }
+                    catch (KeeperException.BadVersionException ignored) {
+                        if (log.isDebugEnabled())
+                            log.debug("Failed to save no servers message. Path version changed.");
+
+                        rtState.zkClient.getChildrenAsync(zkPaths.aliveNodesDir, null,
+                            new CheckClientsStatusCallback(rtState));
+                    }
                 }
                 else
                     U.warn(log, "All server nodes failed (received events from new cluster).");
@@ -1424,14 +1423,7 @@ public class ZookeeperDiscoveryImpl {
 
         byte[] newEvtsBytes = marshalZip(evtsData);
 
-        try {
-            rtState.zkClient.setData(zkPaths.evtsPath, newEvtsBytes, evtsStat.getVersion());
-        }
-        catch (KeeperException.BadVersionException e) {
-            // Version can change if new cluster started and saved new events.
-            if (log.isDebugEnabled())
-                log.debug("Failed to save no servers message");
-        }
+        rtState.zkClient.setData(zkPaths.evtsPath, newEvtsBytes, evtsStat.getVersion());
     }
 
     /**
@@ -2610,9 +2602,6 @@ public class ZookeeperDiscoveryImpl {
 
         processNewEvents(newEvts);
 
-        if (rtState.joined)
-            rtState.evtsData = newEvts;
-
         return newEvts;
     }
 
@@ -2742,6 +2731,9 @@ public class ZookeeperDiscoveryImpl {
 
             throw e;
         }
+
+        if (rtState.joined)
+            rtState.evtsData = evtsData;
 
         if (rtState.crd)
             handleProcessedEvents("procEvt");
@@ -2954,8 +2946,6 @@ public class ZookeeperDiscoveryImpl {
                 // Need filter since ZkJoinEventDataForJoined contains single topology snapshot for all joined nodes.
                 if (node.order() >= locNode.order())
                     break;
-
-                node.setMetrics(new ClusterMetricsSnapshot());
 
                 rtState.top.addNode(node);
             }
@@ -3448,8 +3438,6 @@ public class ZookeeperDiscoveryImpl {
         joinedNode.order(joinedEvtData.topVer);
         joinedNode.internalId(joinedEvtData.joinedInternalId);
 
-        joinedNode.setMetrics(new ClusterMetricsSnapshot());
-
         rtState.top.addNode(joinedNode);
 
         final List<ClusterNode> topSnapshot = rtState.top.topologySnapshot();
@@ -3663,7 +3651,7 @@ public class ZookeeperDiscoveryImpl {
         ZkDiscoveryCustomEventData ackEvtData = new ZkDiscoveryCustomEventData(
             evtId,
             origEvt.eventId(),
-            origEvt.topologyVersion(), // Use topology version from original event.
+            rtState.evtsData.topVer, // Use actual topology version because topology version must be growing.
             locNode.id(),
             null,
             null);

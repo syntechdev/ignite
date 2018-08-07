@@ -23,6 +23,8 @@ import java.util.UUID;
 import org.apache.ignite.IgniteCheckedException;
 import org.apache.ignite.IgniteLogger;
 import org.apache.ignite.cluster.ClusterNode;
+import org.apache.ignite.failure.FailureContext;
+import org.apache.ignite.failure.FailureType;
 import org.apache.ignite.internal.IgniteInternalFuture;
 import org.apache.ignite.internal.cluster.ClusterTopologyCheckedException;
 import org.apache.ignite.internal.processors.affinity.AffinityTopologyVersion;
@@ -255,9 +257,6 @@ public class IgniteTxHandler {
         req.txState(locTx.txState());
 
         IgniteInternalFuture<GridNearTxPrepareResponse> fut = locTx.prepareAsyncLocal(req);
-
-        if (locTx.isRollbackOnly())
-            locTx.rollbackNearTxLocalAsync();
 
         return fut.chain(new C1<IgniteInternalFuture<GridNearTxPrepareResponse>, GridNearTxPrepareResponse>() {
             @Override public GridNearTxPrepareResponse apply(IgniteInternalFuture<GridNearTxPrepareResponse> f) {
@@ -800,9 +799,9 @@ public class IgniteTxHandler {
         if (locTx != null)
             req.txState(locTx.txState());
 
-        // 'baseVersion' message field is re-used for version to be added in completed versions.
-        if (!req.commit() && req.baseVersion() != null)
-            ctx.tm().addRolledbackTx(null, req.baseVersion());
+        // Always add near version to rollback history to prevent races with rollbacks.
+        if (!req.commit())
+            ctx.tm().addRolledbackTx(null, req.version());
 
         // Transaction on local cache only.
         if (locTx != null && !locTx.nearLocallyMapped() && !locTx.colocatedLocallyMapped())
@@ -885,7 +884,7 @@ public class IgniteTxHandler {
                 req.threadId(),
                 req.futureId(),
                 req.miniId(),
-                new IgniteCheckedException("Transaction has been already completed."));
+                new IgniteTxRollbackCheckedException("Transaction has been already completed or not started yet."));
 
             try {
                 ctx.io().send(nodeId, res, req.policy());
@@ -957,7 +956,23 @@ public class IgniteTxHandler {
             }
         }
         catch (Throwable e) {
-            U.error(log, "Failed completing transaction [commit=" + req.commit() + ", tx=" + tx + ']', e);
+            try {
+                U.error(log, "Failed completing transaction [commit=" + req.commit() + ", tx=" + tx + ']', e);
+            }
+            catch (Throwable e0) {
+                ClusterNode node0 = ctx.discovery().node(nodeId);
+
+                U.error(log, "Failed completing transaction [commit=" + req.commit() + ", tx=" +
+                        CU.txString(tx) + ']', e);
+
+                U.error(log, "Failed to log message due to an error: ", e0);
+
+                if (node0 != null && (!node0.isClient() || node0.isLocal())) {
+                    ctx.kernalContext().failure().process(new FailureContext(FailureType.CRITICAL_ERROR, e));
+
+                    throw e;
+                }
+            }
 
             if (tx != null) {
                 tx.commitError(e);
@@ -1698,6 +1713,8 @@ public class IgniteTxHandler {
             res.invalidPartitionsByCacheId(tx.invalidPartitions());
 
             if (tx.empty() && req.last()) {
+                tx.skipCompletedVersions(req.skipCompletedVersion());
+
                 tx.rollbackRemoteTx();
 
                 return null;
@@ -1878,8 +1895,8 @@ public class IgniteTxHandler {
      * @param res Response.
      */
     protected void processCheckPreparedTxResponse(UUID nodeId, GridCacheTxRecoveryResponse res) {
-        if (txRecoveryMsgLog.isDebugEnabled()) {
-            txRecoveryMsgLog.debug("Received tx recovery response [txId=" + res.version() +
+        if (txRecoveryMsgLog.isInfoEnabled()) {
+            txRecoveryMsgLog.info("Received tx recovery response [txId=" + res.version() +
                 ", node=" + nodeId +
                 ", res=" + res + ']');
         }
@@ -1887,8 +1904,8 @@ public class IgniteTxHandler {
         GridCacheTxRecoveryFuture fut = (GridCacheTxRecoveryFuture)ctx.mvcc().future(res.futureId());
 
         if (fut == null) {
-            if (txRecoveryMsgLog.isDebugEnabled()) {
-                txRecoveryMsgLog.debug("Failed to find future for tx recovery response [txId=" + res.version() +
+            if (txRecoveryMsgLog.isInfoEnabled()) {
+                txRecoveryMsgLog.info("Failed to find future for tx recovery response [txId=" + res.version() +
                     ", node=" + nodeId + ", res=" + res + ']');
             }
 
